@@ -8,7 +8,7 @@ Thank you for considering contributing! Your help is appreciated and makes this 
    Create your own fork and make changes there.
 
 2. **Create a branch**  
-   Use descriptive branch names, e.g., `feature/add-pull-image` or `bugfix/container-id`.
+   Use descriptive branch names, e.g., `feature/add-mutlithread-parser` or `bugfix/parser`.
 
 3. **Make your changes**  
    - Follow the existing coding style.
