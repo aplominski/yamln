@@ -11,7 +11,6 @@ yamln is a lightweight C++ library for parsing and serializing YAML data. It pro
 - **Anchors and Aliases**: Handles YAML anchors (`&name`) and aliases (`*name`) using shared pointers for efficient reference sharing.
 - **Type-Safe Access**: Provides type checking methods (e.g., `is_mapping()`, `is_sequence()`) and getters (e.g., `as_mapping()`, `as_string()`) with runtime error handling for invalid accesses.
 - **Operator Overloads**: Convenient access to mappings and sequences using `[]` operators.
-- **Header-Only**: No compilation required; just include the header in your project.
 - **Standards Compliance**: Built with C++17 features like `std::variant` and `std::optional`.
 
 ## Usage
