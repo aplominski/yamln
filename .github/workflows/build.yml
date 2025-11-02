@@ -1,0 +1,91 @@
+name: Build and publish as release
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install dependencies 
+        run: |
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            sudo DEBIAN_FRONTEND=noninteractive apt update
+            sudo DEBIAN_FRONTEND=noninteractive apt install -y ninja-build meson gcc g++
+          elif [[ "${{ runner.os }}" == "macOS" ]]; then
+            brew update
+            brew install ninja meson
+          fi
+        shell: bash
+
+      # Build project 
+      - name: Build project
+        run: |
+          meson setup build --buildtype release
+          meson compile -C build
+        shell: bash
+
+      - name: Package artifacts
+        run: |
+          mkdir -p artifacts
+          cp -r include artifacts/
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            cp build/libyamln.so artifacts/
+          elif [[ "${{ runner.os }}" == "macOS" ]]; then
+            cp build/libyamln.dylib artifacts/
+          fi
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: yamln-${{ matrix.os }}
+          path: artifacts
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release archive
+        run: |
+          mkdir -p release
+          tar -czf release/yamln-${{ github.run_number }}.tar.gz -C artifacts .
+        shell: bash
+
+      - name: Create GitHub Release
+        id: create_release
+        uses: actions/create-release@v1
+        with:
+          tag_name: yamln-${{ github.run_number }}
+          release_name: yamln-${{ github.run_number }}
+          body: "Automated release of yamln"
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload release asset
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./release/yamln-${{ github.run_number }}.tar.gz
+          asset_name: yamln-${{ github.run_number }}.tar.gz
+          asset_content_type: application/gzip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
