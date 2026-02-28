@@ -1,252 +1,538 @@
-#include <string>
-#include <variant>
-#include <vector>
-#include <map>
-#include <stdexcept>
-#include <optional>
-#include <memory>
+#include "yamln.h"
 #include <sstream>
-#include <functional>
+#include <cctype>
+#include <algorithm>
+#include <cstdlib>
+#include <cassert>
 
-#include <yamln.h>
 namespace yamln {
 
-__attribute__((visibility("default"))) Node parse(const std::string& yaml) {
-    std::vector<std::string> lines;
-    std::istringstream iss(yaml);
-    std::string line;
-    while (std::getline(iss, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        lines.push_back(line);
+// ============================================================
+//  Parser
+// ============================================================
+
+struct ParseError : std::runtime_error {
+    ParseError(const std::string& msg, int line, int col)
+        : std::runtime_error("YAML parse error at line " + std::to_string(line) +
+                             ", col " + std::to_string(col) + ": " + msg) {}
+};
+
+class Parser {
+public:
+    explicit Parser(const std::string& src) : src_(src), pos_(0), line_(1), col_(1) {}
+
+    Node parse_document() {
+        skip_document_start();
+        Node root = parse_node(0);
+        skip_whitespace_and_comments();
+        if (pos_ < src_.size() && src_.substr(pos_, 3) == "...")
+            pos_ += 3;
+        return root;
     }
 
-    auto get_indent = [](const std::string& l) -> int {
-        int count = 0;
-        for (char c : l) {
-            if (c != ' ') break;
-            count++;
+private:
+    const std::string& src_;
+    size_t pos_;
+    int line_, col_;
+    std::map<std::string, NodeRef> anchors_;
+
+    // ---- source primitives ----
+
+    char peek(size_t offset = 0) const {
+        size_t p = pos_ + offset;
+        return p < src_.size() ? src_[p] : '\0';
+    }
+
+    char advance() {
+        char c = src_[pos_++];
+        if (c == '\n') { ++line_; col_ = 1; }
+        else ++col_;
+        return c;
+    }
+
+    bool at_end() const { return pos_ >= src_.size(); }
+
+    void skip_inline_space() {
+        while (!at_end() && (peek() == ' ' || peek() == '\t')) advance();
+    }
+
+    void skip_to_eol() {
+        while (!at_end() && peek() != '\n') advance();
+    }
+
+    // Skip all whitespace (including newlines) and full-line comments
+    void skip_whitespace_and_comments() {
+        while (!at_end()) {
+            char c = peek();
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') { advance(); }
+            else if (c == '#') { skip_to_eol(); }
+            else break;
         }
-        return count;
-    };
+    }
 
-    auto trim = [](const std::string& s) -> std::string {
-        size_t start = s.find_first_not_of(" \t");
-        if (start == std::string::npos) return "";
-        size_t end = s.find_last_not_of(" \t");
-        return s.substr(start, end - start + 1);
-    };
-
-    auto trim_left = [](const std::string& s) -> std::string {
-        size_t start = s.find_first_not_of(" \t");
-        if (start == std::string::npos) return "";
-        return s.substr(start);
-    };
-
-    auto get_content = [&get_indent, &trim](const std::string& l) -> std::string {
-        int ind = get_indent(l);
-        std::string cont = l.substr(ind);
-        size_t hash = cont.find('#');
-        if (hash != std::string::npos) cont = cont.substr(0, hash);
-        size_t end = cont.find_last_not_of(" \t");
-        if (end == std::string::npos) return "";
-        return cont.substr(0, end + 1);
-    };
-
-    auto skip_empty_lines = [&lines, &get_content](size_t& idx) {
-        while (idx < lines.size() && get_content(lines[idx]).empty()) {
-            idx++;
+    // Skip spaces/tabs and inline comments (do NOT skip newlines)
+    void skip_inline_whitespace_and_comments() {
+        while (!at_end()) {
+            char c = peek();
+            if (c == ' ' || c == '\t') advance();
+            else if (c == '#') { skip_to_eol(); break; }
+            else break;
         }
-    };
+    }
 
-    auto parse_scalar = [&trim](std::string cont) -> Node {
-        cont = trim(cont);
-        if (cont == "~" || cont == "null" || cont.empty()) return Node(nullptr);
-        if (cont == "true") return Node(true);
-        if (cont == "false") return Node(false);
-        try {
-            if (cont.find('.') != std::string::npos || cont.find('e') != std::string::npos || cont.find('E') != std::string::npos) {
-                return Node(std::stod(cont));
-            } else {
-                return Node(std::stoi(cont));
-            }
-        } catch (...) {
-            return Node(cont);
+    // Count leading spaces on the current line (without advancing)
+    int current_indent() const {
+        int i = 0;
+        while (pos_ + i < src_.size() && src_[pos_ + i] == ' ') ++i;
+        return i;
+    }
+
+    void skip_document_start() {
+        skip_whitespace_and_comments();
+        if (pos_ + 3 <= src_.size() && src_.substr(pos_, 3) == "---") {
+            pos_ += 3; col_ += 3;
+            skip_to_eol();
+            skip_whitespace_and_comments();
         }
-    };
+    }
 
-    std::function<Node(size_t&, int, std::map<std::string, NodeRef>&)> parse_sequence;
-    std::function<Node(size_t&, int, std::map<std::string, NodeRef>&)> parse_mapping;
-    std::function<Node(size_t&, int, std::map<std::string, NodeRef>&)> parse_node;
+    // ---- scalar parsing ----
 
-    parse_sequence = [&lines, &skip_empty_lines, &get_content, &get_indent, &trim_left, &parse_scalar, &parse_node](size_t& idx, int cur_ind, std::map<std::string, NodeRef>& anch) -> Node {
-        Sequence seq;
-        while (idx < lines.size()) {
-            skip_empty_lines(idx);
-            if (idx >= lines.size()) break;
-            int th_ind = get_indent(lines[idx]);
-            if (th_ind < cur_ind) break;
-            if (th_ind > cur_ind) throw std::runtime_error("Indent error in sequence");
-            std::string cnt = get_content(lines[idx]);
-            if (cnt.compare(0, 1, "-") != 0) break;
-            std::optional<std::string> it_anch;
-            std::string it_cnt = trim_left(cnt.substr(1));
-            if (it_cnt.compare(0, 1, "&") == 0) {
-                size_t sp = it_cnt.find(' ');
-                if (sp == std::string::npos) sp = it_cnt.size();
-                it_anch = it_cnt.substr(1, sp - 1);
-                it_cnt = trim_left(it_cnt.substr(sp));
-            }
-            Node item;
-            bool on_same_line = !it_cnt.empty();
-            if (it_cnt.compare(0, 1, "*") == 0) {
-                std::string al = it_cnt.substr(1);
-                auto it = anch.find(al);
-                if (it == anch.end()) throw std::runtime_error("Unknown alias: " + al);
-                item = Node(it->second);
-            } else if (on_same_line) {
-                item = parse_scalar(it_cnt);
-            } else {
-                idx++;
-                skip_empty_lines(idx);
-                if (idx >= lines.size()) throw std::runtime_error("Unexpected EOF in sequence item");
-                int child_ind = get_indent(lines[idx]);
-                if (child_ind <= cur_ind) throw std::runtime_error("Missing indent for sequence block item");
-                item = parse_node(idx, child_ind, anch);
-            }
-            if (it_anch) {
-                NodeRef ref = std::make_shared<Node>(std::move(item));
-                ref->anchor = *it_anch;
-                anch[*it_anch] = ref;
-                item = Node(ref);
-            }
-            seq.push_back(std::move(item));
-            if (on_same_line) idx++;
+    std::string parse_plain_scalar() {
+        std::string result;
+        while (!at_end()) {
+            char c = peek();
+            if (c == ':' && (peek(1) == ' ' || peek(1) == '\t' || peek(1) == '\n' || peek(1) == '\0'))
+                break;
+            if (c == '#' && !result.empty() && (result.back() == ' ' || result.back() == '\t'))
+                break;
+            if (c == '\n' || c == '\r') break;
+            if (c == ',' || c == '}' || c == ']') break;
+            result += advance();
         }
-        return Node(std::move(seq));
-    };
+        while (!result.empty() && (result.back() == ' ' || result.back() == '\t'))
+            result.pop_back();
+        return result;
+    }
 
-    parse_mapping = [&lines, &skip_empty_lines, &get_content, &get_indent, &trim, &trim_left, &parse_scalar, &parse_node](size_t& idx, int cur_ind, std::map<std::string, NodeRef>& anch) -> Node {
-        Mapping mapp;
-        while (idx < lines.size()) {
-            skip_empty_lines(idx);
-            if (idx >= lines.size()) break;
-            int th_ind = get_indent(lines[idx]);
-            if (th_ind < cur_ind) break;
-            if (th_ind > cur_ind) throw std::runtime_error("Indent error in mapping");
-            std::string cnt = get_content(lines[idx]);
-            if (cnt.empty()) { idx++; continue; }
-            size_t col = cnt.find(':');
-            if (col == std::string::npos) break;
-            std::string ky = trim(cnt.substr(0, col));
-            std::string val_cnt = trim_left(cnt.substr(col + 1));
-            std::optional<std::string> val_anch;
-            if (val_cnt.compare(0, 1, "&") == 0) {
-                size_t sp = val_cnt.find(' ');
-                if (sp == std::string::npos) sp = val_cnt.size();
-                val_anch = val_cnt.substr(1, sp - 1);
-                val_cnt = trim_left(val_cnt.substr(sp));
-            }
-            Node val;
-            bool on_same_line = !val_cnt.empty();
-            if (val_cnt.compare(0, 1, "*") == 0) {
-                std::string al = val_cnt.substr(1);
-                auto it = anch.find(al);
-                if (it == anch.end()) throw std::runtime_error("Unknown alias: " + al);
-                val = Node(it->second);
-            } else if (on_same_line) {
-                val = parse_scalar(val_cnt);
-            } else {
-                idx++;
-                skip_empty_lines(idx);
-                if (idx >= lines.size()) {
-                    val = Node(nullptr);
-                } else {
-                    int child_ind = get_indent(lines[idx]);
-                    if (child_ind <= cur_ind) {
-                        val = Node(nullptr);
-                        idx--;  // rewind to process next entry
-                    } else {
-                        val = parse_node(idx, child_ind, anch);
-                    }
+    std::string parse_double_quoted() {
+        assert(peek() == '"');
+        advance();
+        std::string result;
+        while (!at_end() && peek() != '"') {
+            char c = advance();
+            if (c == '\\') {
+                if (at_end()) throw ParseError("Unterminated escape sequence", line_, col_);
+                char e = advance();
+                switch (e) {
+                    case 'n':  result += '\n'; break;
+                    case 't':  result += '\t'; break;
+                    case 'r':  result += '\r'; break;
+                    case '"':  result += '"';  break;
+                    case '\\': result += '\\'; break;
+                    case '0':  result += '\0'; break;
+                    default:   result += '\\'; result += e; break;
                 }
+            } else {
+                result += c;
             }
-            if (val_anch) {
-                NodeRef ref = std::make_shared<Node>(std::move(val));
-                ref->anchor = *val_anch;
-                anch[*val_anch] = ref;
-                val = Node(ref);
-            }
-            mapp[ky] = std::move(val);
-            if (on_same_line) idx++;
         }
-        return Node(std::move(mapp));
-    };
+        if (at_end()) throw ParseError("Unterminated double-quoted string", line_, col_);
+        advance(); // closing "
+        return result;
+    }
 
-    parse_node = [&lines, &skip_empty_lines, &get_indent, &get_content, &trim_left, &parse_scalar, &parse_sequence, &parse_mapping](size_t& idx, int cur_ind, std::map<std::string, NodeRef>& anch) -> Node {
-        skip_empty_lines(idx);
-        if (idx >= lines.size()) throw std::runtime_error("Unexpected EOF");
-        int th_ind = get_indent(lines[idx]);
-        if (th_ind != cur_ind) throw std::runtime_error("Indentation mismatch: expected " + std::to_string(cur_ind) + ", got " + std::to_string(th_ind));
-        std::string cnt = get_content(lines[idx]);
-        std::optional<std::string> anch_opt;
-        std::string val_cnt;
-        if (cnt.compare(0, 1, "&") == 0) {
-            size_t sp = cnt.find(' ');
-            if (sp == std::string::npos) sp = cnt.size();
-            anch_opt = cnt.substr(1, sp - 1);
-            val_cnt = trim_left(cnt.substr(sp));
-        } else {
-            val_cnt = cnt;
+    std::string parse_single_quoted() {
+        assert(peek() == '\'');
+        advance();
+        std::string result;
+        while (!at_end()) {
+            char c = advance();
+            if (c == '\'') {
+                if (peek() == '\'') { result += '\''; advance(); }
+                else break;
+            } else {
+                result += c;
+            }
         }
-        if (val_cnt.compare(0, 1, "*") == 0) {
-            std::string al = val_cnt.substr(1);
-            auto it = anch.find(al);
-            if (it == anch.end()) throw std::runtime_error("Unknown alias: " + al);
-            idx++;
+        return result;
+    }
+
+    // Parse block scalar (| or >) - simplified chomping
+    std::string parse_block_scalar(char indicator, int parent_indent) {
+        advance(); // consume | or >
+        char chomp = 'c'; // clip by default
+        if (!at_end() && (peek() == '-' || peek() == '+')) chomp = advance();
+        while (!at_end() && std::isdigit((unsigned char)peek())) advance(); // skip explicit indent
+        skip_inline_whitespace_and_comments();
+        if (!at_end() && peek() == '\n') advance();
+
+        int block_indent = -1;
+        std::string result;
+        std::string trailing_newlines;
+
+        while (!at_end()) {
+            // Count spaces on this line
+            size_t tmp_pos = pos_;
+            int ind = 0;
+            while (tmp_pos < src_.size() && src_[tmp_pos] == ' ') { ++ind; ++tmp_pos; }
+
+            // Empty or blank line
+            if (tmp_pos >= src_.size() || src_[tmp_pos] == '\n' || src_[tmp_pos] == '\r') {
+                while (!at_end() && peek() != '\n') advance();
+                if (!at_end()) advance();
+                trailing_newlines += '\n';
+                continue;
+            }
+
+            if (block_indent == -1) {
+                if (ind <= parent_indent) break;
+                block_indent = ind;
+            }
+            if (ind < block_indent) break;
+
+            result += trailing_newlines;
+            trailing_newlines.clear();
+
+            for (int i = 0; i < block_indent; ++i) advance();
+
+            std::string line_content;
+            while (!at_end() && peek() != '\n' && peek() != '\r') line_content += advance();
+            if (!at_end() && peek() == '\r') advance();
+            if (!at_end() && peek() == '\n') advance();
+
+            if (indicator == '>') {
+                if (!result.empty() && result.back() != '\n') result += ' ';
+                result += line_content;
+            } else {
+                result += line_content + '\n';
+            }
+        }
+
+        // Chomping
+        if (chomp == '-') {
+            while (!result.empty() && result.back() == '\n') result.pop_back();
+        } else if (chomp == '+') {
+            result += trailing_newlines;
+        } else {
+            // clip: exactly one trailing newline
+            while (!result.empty() && result.back() == '\n') result.pop_back();
+            result += '\n';
+        }
+        return result;
+    }
+
+    // ---- type coercion ----
+
+    Node coerce_scalar(const std::string& s) {
+        if (s == "null" || s == "~" || s.empty()) return Node(nullptr);
+        if (s == "true"  || s == "True"  || s == "TRUE")  return Node(true);
+        if (s == "false" || s == "False" || s == "FALSE") return Node(false);
+
+        // Try int
+        {
+            size_t i = 0;
+            if (s[0] == '-' || s[0] == '+') ++i;
+            bool all_digits = (i < s.size());
+            for (size_t j = i; j < s.size(); ++j) {
+                if (!std::isdigit((unsigned char)s[j])) { all_digits = false; break; }
+            }
+            if (all_digits && i < s.size()) {
+                try { return Node(std::stoi(s)); } catch (...) {}
+            }
+        }
+
+        // Try double
+        {
+            char* end = nullptr;
+            double d = std::strtod(s.c_str(), &end);
+            if (end && end != s.c_str() && *end == '\0') return Node(d);
+        }
+
+        return Node(s);
+    }
+
+    // ---- flow context scalars (stop at , ] }) ----
+
+    Node parse_flow_scalar(int indent) {
+        skip_inline_space();
+        if (at_end()) return Node(nullptr);
+        char c = peek();
+        if (c == '[')  return parse_flow_sequence(indent);
+        if (c == '{')  return parse_flow_mapping(indent);
+        if (c == '"')  return Node(parse_double_quoted());
+        if (c == '\'') return Node(parse_single_quoted());
+        if (c == '*') {
+            advance();
+            std::string alias = parse_anchor_name();
+            auto it = anchors_.find(alias);
+            if (it == anchors_.end()) throw ParseError("Unknown alias: *" + alias, line_, col_);
             return Node(it->second);
         }
-        bool is_block = val_cnt.empty();
-        int ch_ind = -1;
-        size_t peek_idx = idx;
-        std::string peek_cnt = val_cnt;
-        if (is_block) {
-            peek_idx++;
-            skip_empty_lines(peek_idx);
-            if (peek_idx >= lines.size() || get_indent(lines[peek_idx]) <= cur_ind) {
-                is_block = false;
-                peek_cnt = "";
+        // Plain flow scalar
+        std::string s;
+        while (!at_end() && peek() != ',' && peek() != ']' && peek() != '}' && peek() != '\n') {
+            if (peek() == '#' && (s.empty() || s.back() == ' ')) break;
+            s += advance();
+        }
+        while (!s.empty() && s.back() == ' ') s.pop_back();
+        return coerce_scalar(s);
+    }
+
+    Node parse_flow_sequence(int indent) {
+        assert(peek() == '[');
+        advance();
+        Sequence seq;
+        skip_whitespace_and_comments();
+        while (!at_end() && peek() != ']') {
+            seq.push_back(parse_flow_scalar(indent));
+            skip_whitespace_and_comments();
+            if (peek() == ',') { advance(); skip_whitespace_and_comments(); }
+        }
+        if (at_end()) throw ParseError("Unterminated flow sequence", line_, col_);
+        advance(); // ]
+        return Node(seq);
+    }
+
+    Node parse_flow_mapping(int indent) {
+        assert(peek() == '{');
+        advance();
+        Mapping map;
+        skip_whitespace_and_comments();
+        while (!at_end() && peek() != '}') {
+            std::string key;
+            if (peek() == '"')       key = parse_double_quoted();
+            else if (peek() == '\'') key = parse_single_quoted();
+            else {
+                while (!at_end() && peek() != ':' && peek() != '}' && peek() != '\n')
+                    key += advance();
+                while (!key.empty() && key.back() == ' ') key.pop_back();
+            }
+            skip_inline_space();
+            if (peek() != ':') throw ParseError("Expected ':' in flow mapping", line_, col_);
+            advance();
+            skip_inline_space();
+            map[key] = parse_flow_scalar(indent);
+            skip_whitespace_and_comments();
+            if (peek() == ',') { advance(); skip_whitespace_and_comments(); }
+        }
+        if (at_end()) throw ParseError("Unterminated flow mapping", line_, col_);
+        advance(); // }
+        return Node(map);
+    }
+
+    // ---- anchor / alias helpers ----
+
+    std::string parse_anchor_name() {
+        std::string name;
+        while (!at_end() && !std::isspace((unsigned char)peek()) &&
+               peek() != ',' && peek() != '[' && peek() != ']' &&
+               peek() != '{' && peek() != '}') {
+            name += advance();
+        }
+        if (name.empty()) throw ParseError("Empty anchor/alias name", line_, col_);
+        return name;
+    }
+
+    // ---- block sequence ----
+    // Called when pos_ is AT the '-' of the first item.
+    // `indent` = 0-indexed column of the '-' markers.
+    Node parse_block_sequence(int indent) {
+        Sequence seq;
+        while (!at_end()) {
+            {
+                size_t saved = pos_; int sl = line_, sc = col_;
+                skip_whitespace_and_comments();
+                if (at_end()) break;
+                int ind = col_ - 1; // 0-indexed column
+                if (peek() != '-') { pos_ = saved; line_ = sl; col_ = sc; break; }
+                if (ind != indent)  { pos_ = saved; line_ = sl; col_ = sc; break; }
+            }
+            // Ensure it's actually a sequence item, not e.g. a negative number
+            if (peek(1) != ' ' && peek(1) != '\t' && peek(1) != '\n' && peek(1) != '\0') break;
+            advance(); // consume '-'
+            if (!at_end() && (peek() == ' ' || peek() == '\t')) advance();
+            skip_inline_space();
+
+            if (!at_end() && (peek() == '\n' || peek() == '\r' || peek() == '#')) {
+                skip_inline_whitespace_and_comments();
+                if (!at_end() && peek() == '\n') advance();
+                size_t saved = pos_; int sl = line_, sc = col_;
+                skip_whitespace_and_comments();
+                if (at_end() || col_ - 1 <= indent) {
+                    pos_ = saved; line_ = sl; col_ = sc;
+                    seq.push_back(Node(nullptr));
+                } else {
+                    seq.push_back(parse_node(col_ - 1));
+                }
             } else {
-                ch_ind = get_indent(lines[peek_idx]);
-                peek_cnt = get_content(lines[peek_idx]);
+                seq.push_back(parse_node(indent));
+                skip_inline_whitespace_and_comments();
+                if (!at_end() && (peek() == '\n' || peek() == '\r')) advance();
             }
         }
-        if (is_block) idx = peek_idx;
-        bool seq = peek_cnt.compare(0, 1, "-") == 0;
-        bool mapp = !seq && peek_cnt.find(':') != std::string::npos;
-        Node n;
-        if (seq) {
-            n = parse_sequence(idx, is_block ? ch_ind : cur_ind, anch);
-        } else if (mapp) {
-            n = parse_mapping(idx, is_block ? ch_ind : cur_ind, anch);
-        } else {
-            n = parse_scalar(val_cnt);
-            idx++;
-        }
-        if (anch_opt) {
-            NodeRef ref = std::make_shared<Node>(std::move(n));
-            ref->anchor = *anch_opt;
-            anch[*anch_opt] = ref;
-            n = Node(ref);
-        }
-        return n;
-    };
+        return Node(seq);
+    }
 
-    std::map<std::string, NodeRef> anchors;
-    size_t idx = 0;
-    Node root = parse_node(idx, 0, anchors);
-    skip_empty_lines(idx);
-    if (idx < lines.size()) throw std::runtime_error("Extra content after root node");
-    return root;
+    // ---- block mapping ----
+    // Called when pos_ is AT the first char of the first key (indent spaces already consumed).
+    // `indent` = 0-indexed column of the keys.
+    Node parse_block_mapping(int indent) {
+        Mapping map;
+        while (!at_end()) {
+            {
+                size_t saved = pos_; int sl = line_, sc = col_;
+                skip_whitespace_and_comments();
+                if (at_end()) break;
+                int ind = col_ - 1;
+                if (ind < indent) { pos_ = saved; line_ = sl; col_ = sc; break; }
+                if (ind > indent) { pos_ = saved; line_ = sl; col_ = sc; break; }
+            }
+            // Now at correct indent, peek at first char of key
+
+            std::string key;
+            if (peek() == '"') {
+                key = parse_double_quoted();
+            } else if (peek() == '\'') {
+                key = parse_single_quoted();
+            } else {
+                // Verify colon exists on this line
+                size_t p = pos_;
+                bool found_colon = false;
+                while (p < src_.size() && src_[p] != '\n') {
+                    if (src_[p] == ':' &&
+                        (p + 1 >= src_.size() ||
+                         src_[p+1] == ' ' || src_[p+1] == '\t' ||
+                         src_[p+1] == '\n' || src_[p+1] == '\0')) {
+                        found_colon = true;
+                        break;
+                    }
+                    ++p;
+                }
+                if (!found_colon) break;
+                while (!at_end() && peek() != ':' && peek() != '\n') key += advance();
+                while (!key.empty() && key.back() == ' ') key.pop_back();
+            }
+
+            skip_inline_space();
+            if (at_end() || peek() != ':')
+                throw ParseError("Expected ':' after key '" + key + "'", line_, col_);
+            advance(); // ':'
+            skip_inline_space();
+
+            Node value;
+            if (!at_end() && (peek() == '\n' || peek() == '\r' || peek() == '#')) {
+                skip_inline_whitespace_and_comments();
+                if (!at_end() && peek() == '\n') advance();
+                size_t saved = pos_; int sl = line_, sc = col_;
+                skip_whitespace_and_comments();
+                if (at_end() || col_ - 1 <= indent) {
+                    pos_ = saved; line_ = sl; col_ = sc;
+                    value = Node(nullptr);
+                } else {
+                    value = parse_node(col_ - 1);
+                }
+            } else {
+                // Inline value - pass key's indent so block scalars use correct parent_indent
+                value = parse_node(indent);
+                skip_inline_whitespace_and_comments();
+                if (!at_end() && (peek() == '\n' || peek() == '\r')) advance();
+            }
+            map[key] = std::move(value);
+        }
+        return Node(map);
+    }
+
+    // ---- main node dispatch ----
+    // `indent` = the indent of the containing key (for block scalars and block children).
+    // pos_ is positioned at the first non-space character of the value
+    // (for inline values, caller already consumed leading spaces).
+    Node parse_node(int indent) {
+        skip_inline_space();
+
+        // Anchor handling
+        std::optional<std::string> anchor_name;
+        if (!at_end() && peek() == '&') {
+            advance();
+            anchor_name = parse_anchor_name();
+            skip_inline_space();
+        }
+
+        // Alias
+        if (!at_end() && peek() == '*') {
+            advance();
+            std::string alias = parse_anchor_name();
+            auto it = anchors_.find(alias);
+            if (it == anchors_.end()) throw ParseError("Unknown alias: *" + alias, line_, col_);
+            return Node(it->second);
+        }
+
+        Node result;
+
+        if (at_end()) {
+            result = Node(nullptr);
+        } else if (peek() == '\n' || peek() == '\r') {
+            // Anchor on same line as key, actual value is the block below
+            if (anchor_name) {
+                skip_inline_whitespace_and_comments();
+                if (!at_end() && peek() == '\n') advance();
+                size_t saved = pos_; int sl = line_, sc = col_;
+                skip_whitespace_and_comments();
+                if (!at_end() && col_ - 1 > indent) {
+                    result = parse_node(col_ - 1);
+                } else {
+                    pos_ = saved; line_ = sl; col_ = sc;
+                    result = Node(nullptr);
+                }
+            } else {
+                result = Node(nullptr);
+            }
+        } else if (peek() == '[') {
+            result = parse_flow_sequence(indent);
+        } else if (peek() == '{') {
+            result = parse_flow_mapping(indent);
+        } else if (peek() == '"') {
+            result = Node(parse_double_quoted());
+        } else if (peek() == '\'') {
+            result = Node(parse_single_quoted());
+        } else if (peek() == '|' || peek() == '>') {
+            char blk = peek();
+            result = Node(parse_block_scalar(blk, indent));
+        } else if (peek() == '-' && (peek(1) == ' ' || peek(1) == '\t' || peek(1) == '\n' || peek(1) == '\0')) {
+            int seq_indent = col_ - 1;
+            result = parse_block_sequence(seq_indent);
+        } else {
+            // Check for block mapping (colon on this line)
+            size_t p = pos_;
+            bool is_map_key = false;
+            while (p < src_.size() && src_[p] != '\n') {
+                if (src_[p] == ':' && (p + 1 >= src_.size() ||
+                    src_[p+1] == ' ' || src_[p+1] == '\t' ||
+                    src_[p+1] == '\n' || src_[p+1] == '\0')) {
+                    is_map_key = true;
+                    break;
+                }
+                ++p;
+            }
+            if (is_map_key) {
+                result = parse_block_mapping(col_ - 1);
+            } else {
+                result = coerce_scalar(parse_plain_scalar());
+            }
+        }
+
+        if (anchor_name) {
+            result.anchor = anchor_name;
+            anchors_[*anchor_name] = std::make_shared<Node>(result);
+        }
+
+        return result;
+    }
+};
+
+Node parse(const std::string& yaml) {
+    Parser p(yaml);
+    return p.parse_document();
 }
 
 } // namespace yamln
