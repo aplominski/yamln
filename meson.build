@@ -11,8 +11,11 @@ project('yamln', 'cpp',
 )
 
 yamln_src = files(
-    'src/yamln_serialize.cpp',
-    'src/yamln_parser.cpp'
+    'src/parser/yamln_parser.cpp',
+    'src/parser/yamln_parser_scalar.cpp',
+    'src/parser/yamln_parser_flow.cpp',
+    'src/parser/yamln_parser_block.cpp',
+    'src/serializer/yamln_serialize.cpp'
 )
 
 yamln_inc = include_directories('include')
